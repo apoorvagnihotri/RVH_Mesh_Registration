@@ -11,13 +11,12 @@ import sys
 sys.path.append(os.getcwd())
 from os.path import exists
 from pathlib import Path
+from typing import Optional
 
 import torch
 from pytorch3d.loss import point_mesh_face_distance
 from pytorch3d.structures import Meshes, Pointclouds
 from tqdm import tqdm
-
-from typing import Optional
 
 from lib.body_objectives import batch_3djoints_loss
 from lib.smpl.priors.th_hand_prior import HandPrior
@@ -35,7 +34,7 @@ class SMPLHFitter(BaseFitter):
         save_path: Optional[str] = None,
     ):
         """Fit smpl to scans.
-        
+
         Args:
             scans: list of paths to scans
             pose_files: list of paths to 3d body joints
@@ -50,7 +49,7 @@ class SMPLHFitter(BaseFitter):
         th_scan_meshes, centers = self.load_scans(scans, device=device, ret_cent=True)
 
         # init smpl
-        smpl = self.init_smpl(
+        smpl = self.init_smpl_v2(
             batch_sz, gender, trans=centers
         )  # add centers as initial SMPL translation
 
@@ -81,7 +80,7 @@ class SMPLHFitter(BaseFitter):
     ):
         """Optimize pose and shape of smpl."""
         # Optimizer
-        optimizer = torch.optim.Adam([smpl.trans, smpl.betas, smpl.pose], 0.02, betas=(0.9, 0.999))
+        optimizer = torch.optim.Adam(smpl.parameters(), 0.02, betas=(0.9, 0.999))
         # Get loss_weights
         weight_dict = self.get_loss_weights()
 
@@ -93,6 +92,8 @@ class SMPLHFitter(BaseFitter):
                 # Get losses for a forward pass
                 loss_dict = self.forward_pose_shape(th_scan_meshes, smpl, th_pose_3d)
                 # Get total loss for backward pass
+                # log metrics to wandb
+                wandb.log(loss_dict)
                 tot_loss = self.backward_step(loss_dict, weight_dict, it)
                 tot_loss.backward()
                 optimizer.step()
@@ -114,8 +115,11 @@ class SMPLHFitter(BaseFitter):
         prior = get_prior(self.model_root, smpl.gender, device=self.device)
 
         # forward
-        verts, _, _, _ = smpl()
-        th_smpl_meshes = Meshes(verts=verts, faces=torch.stack([smpl.faces] * len(verts), dim=0))
+        output = smpl.forward(return_full_pose=True)
+        verts = output.vertices
+        th_smpl_meshes = Meshes(
+            verts=verts, faces=torch.stack([smpl.faces_tensor] * len(verts), dim=0)
+        )
 
         # losses
         loss = dict()
@@ -126,7 +130,7 @@ class SMPLHFitter(BaseFitter):
             th_scan_meshes, Pointclouds(points=th_smpl_meshes.verts_list())
         )
         loss["betas"] = torch.mean(smpl.betas**2)
-        loss["pose_pr"] = torch.mean(prior(smpl.pose))
+        loss["pose_pr"] = torch.mean(prior(output.full_pose))
         if self.hands:
             hand_prior = HandPrior(self.model_root, type="grab")
             loss["hand"] = torch.mean(hand_prior(smpl.pose))  # add hand prior if smplh is used
@@ -260,12 +264,13 @@ def main(args):
 if __name__ == "__main__":
     import argparse
 
+    import wandb
     from utils.configs import load_config
 
     parser = argparse.ArgumentParser(description="Run Model")
     parser.add_argument("scan_path", type=str, help="path to the 3d scans")
-    parser.add_argument("save_path", type=str, help="save path for all scans")
     parser.add_argument("-gender", type=str, default="male")  # can be female
+    parser.add_argument("--save_path", type=str, help="save path for all scans", default=None)
     parser.add_argument("--pose_file", type=str, help="3d body joints file", default=None)
     parser.add_argument("--display", default=False, action="store_true")
     parser.add_argument(
@@ -275,6 +280,14 @@ if __name__ == "__main__":
         "-hands", default=False, action="store_true", help="use SMPL+hand model or not"
     )
     args = parser.parse_args()
+
+    # start a new wandb run to track this script
+    wandb.init(
+        # set the wandb project where this run will be logged
+        project="switching-to-smplx",
+        job_type="optimize_smpl",
+        config=args,
+    )
 
     # args.scan_path = 'data/mesh_1/scan.obj'
     # args.pose_file = 'data/mesh_1/3D_joints_all.json'
