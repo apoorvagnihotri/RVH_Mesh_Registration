@@ -11,17 +11,19 @@ import sys
 sys.path.append(os.getcwd())
 from os.path import exists
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 import torch
+from models.split_smpl import SplitSMPL
+from models.utils import get_landmarks
 from pytorch3d.loss import point_mesh_face_distance
 from pytorch3d.structures import Meshes, Pointclouds
+from smplx.body_models import SMPL
 from tqdm import tqdm
 
 from lib.body_objectives import batch_3djoints_loss
 from lib.smpl.priors.th_hand_prior import HandPrior
 from lib.smpl.priors.th_smpl_prior import get_prior
-from lib.smpl.wrapper_pytorch import SMPLPyTorchWrapperBatchSplitParams
 from smpl_registration.base_fitter import BaseFitter
 
 
@@ -50,7 +52,10 @@ class SMPLHFitter(BaseFitter):
 
         # init smpl
         smpl = self.init_smpl_v2(
-            batch_sz, gender, trans=centers
+            batch_sz,
+            gender,
+            trans=centers,
+            split_params=pose_files is not None,
         )  # add centers as initial SMPL translation
 
         # Set optimization hyper parameters
@@ -60,7 +65,7 @@ class SMPLHFitter(BaseFitter):
         if pose_files is not None:
             th_pose_3d = self.load_j3d(pose_files)
 
-            # Optimize pose first
+            # Optimize pose first, you need parameters to be split.
             self.optimize_pose_only(
                 th_scan_meshes, smpl, pose_iterations, pose_steps_per_iter, th_pose_3d
             )
@@ -93,8 +98,9 @@ class SMPLHFitter(BaseFitter):
                 loss_dict = self.forward_pose_shape(th_scan_meshes, smpl, th_pose_3d)
                 # Get total loss for backward pass
                 # log metrics to wandb
-                wandb.log(loss_dict)
                 tot_loss = self.backward_step(loss_dict, weight_dict, it)
+                wandb.log({"pose_shape/" + k: v for k, v in loss_dict.items()})
+                wandb.log({"pose_shape/tot_loss": tot_loss})
                 tot_loss.backward()
                 optimizer.step()
 
@@ -110,7 +116,7 @@ class SMPLHFitter(BaseFitter):
 
         print("** Optimised smpl pose and shape **")
 
-    def forward_pose_shape(self, th_scan_meshes, smpl, th_pose_3d=None):
+    def forward_pose_shape(self, th_scan_meshes, smpl: Union[SplitSMPL, SMPL], th_pose_3d=None):
         # Get pose prior
         prior = get_prior(self.model_root, smpl.gender, device=self.device)
 
@@ -136,7 +142,7 @@ class SMPLHFitter(BaseFitter):
             loss["hand"] = torch.mean(hand_prior(smpl.pose))  # add hand prior if smplh is used
         if th_pose_3d is not None:
             # 3D joints loss
-            J, face, hands = smpl.get_landmarks()
+            J, face, hands = get_landmarks(smpl)
             joints = self.compose_smpl_joints(J, face, hands, th_pose_3d)
             j3d_loss = batch_3djoints_loss(th_pose_3d, joints)
             loss["pose_obj"] = j3d_loss
@@ -151,12 +157,17 @@ class SMPLHFitter(BaseFitter):
         return joints
 
     def optimize_pose_only(
-        self, th_scan_meshes, smpl, iterations, steps_per_iter, th_pose_3d, prior_weight=None
+        self,
+        th_scan_meshes,
+        smpl: SplitSMPL,
+        iterations,
+        steps_per_iter,
+        th_pose_3d,
+        prior_weight=None,
     ):
-        # split_smpl = SMPLHPyTorchWrapperBatchSplitParams.from_smplh(smpl).to(self.device)
-        split_smpl = SMPLPyTorchWrapperBatchSplitParams.from_smpl(smpl).to(self.device)
+        assert "top_betas" in [a[0] for a in smpl.named_parameters()]
         optimizer = torch.optim.Adam(
-            [split_smpl.trans, split_smpl.top_betas, split_smpl.global_pose],
+            smpl.first_stage_params,
             0.02,
             betas=(0.9, 0.999),
         )
@@ -176,12 +187,7 @@ class SMPLHFitter(BaseFitter):
                 print("Optimizing SMPL pose only")
                 loop.set_description("Optimizing SMPL pose only")
                 optimizer = torch.optim.Adam(
-                    [
-                        split_smpl.trans,
-                        split_smpl.top_betas,
-                        split_smpl.global_pose,
-                        split_smpl.body_pose,
-                    ],
+                    smpl.second_stage_params,
                     0.02,
                     betas=(0.9, 0.999),
                 )
@@ -191,9 +197,11 @@ class SMPLHFitter(BaseFitter):
             for i in loop:
                 optimizer.zero_grad()
                 # Get losses for a forward pass
-                loss_dict = self.forward_step_pose_only(split_smpl, th_pose_3d, prior_weight)
+                loss_dict = self.forward_step_pose_only(smpl, th_pose_3d, prior_weight)
                 # Get total loss for backward pass
                 tot_loss = self.backward_step(loss_dict, weight_dict, it / 2)
+                wandb.log({"pose_only/" + k: v for k, v in loss_dict.items()})
+                wandb.log({"pose_only/tot_loss": tot_loss})
                 tot_loss.backward()
                 optimizer.step()
 
@@ -205,19 +213,11 @@ class SMPLHFitter(BaseFitter):
                     loop.set_description(l_str)
 
                 if self.debug:
-                    self.viz_fitting(split_smpl, th_scan_meshes)
-
-        self.copy_smpl_params(smpl, split_smpl)
+                    self.viz_fitting(smpl, th_scan_meshes)
 
         print("** Optimised smpl pose **")
 
-    def copy_smpl_params(self, smpl, split_smpl):
-        # Put back pose, shape and trans into original smpl
-        smpl.pose.data = split_smpl.pose.data
-        smpl.betas.data = split_smpl.betas.data
-        smpl.trans.data = split_smpl.trans.data
-
-    def forward_step_pose_only(self, smpl, th_pose_3d, prior_weight):
+    def forward_step_pose_only(self, smpl: SplitSMPL, th_pose_3d, prior_weight):
         """Performs a forward step, given smpl and scan meshes.
 
         Then computes the losses. currently no prior weight implemented for smplh
@@ -229,9 +229,9 @@ class SMPLHFitter(BaseFitter):
         loss = dict()
         # loss['pose_obj'] = batch_get_pose_obj(th_pose_3d, smpl, init_pose=False)
         # 3D joints loss
-        J, face, hands = smpl.get_landmarks()
+        J, face, hands = get_landmarks(smpl)
         joints = self.compose_smpl_joints(J, face, hands, th_pose_3d)
-        loss["pose_pr"] = torch.mean(prior(smpl.pose))
+        loss["pose_pr"] = torch.mean(prior(smpl.full_pose))
         loss["betas"] = torch.mean(smpl.betas**2)
         j3d_loss = batch_3djoints_loss(th_pose_3d, joints)
         loss["pose_obj"] = j3d_loss

@@ -8,19 +8,19 @@ import json
 import pickle as pkl
 from os.path import join, split, splitext
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional, Union
 
 import numpy as np
 import torch
+from models.split_smpl import SplitSMPL
 from psbody.mesh import Mesh, MeshViewer
 from pytorch3d.io import load_obj, load_ply, save_ply
 from pytorch3d.structures import Meshes
-from smplx.body_models import SMPL  # right now just the model without hands
+from smplx.body_models import SMPL
 
 from lib.smpl.const import *
 from lib.smpl.priors.th_hand_prior import mean_hand_pose
 from lib.smpl.priors.th_smpl_prior import get_prior
-from lib.smpl.wrapper_pytorch import SMPLPyTorchWrapperBatch
 
 
 class BaseFitter:
@@ -94,7 +94,9 @@ class BaseFitter:
         betas: Optional[torch.Tensor] = None,
         trans: Optional[torch.Tensor] = None,
         flip: Optional[bool] = False,
-    ):
+        split_params: Optional[bool] = False,
+        split_params_args: dict[str, Any] = {"top_betas": 2},
+    ) -> Union[SplitSMPL, SMPL]:
         # TODO: Right now basic code for the basic SMPL for 10 betas.
         # TODO: Batches not supported yet
         # TODO: Hands not supported yet
@@ -106,6 +108,7 @@ class BaseFitter:
             gender:
             flip: rotate smpl around z-axis by 180 degree, required for kinect point clouds, which has different coordinate
             from scans
+            split_params: if True, we split the parameters into different groups, to be optimized separately.
 
         Returns:
         """
@@ -134,90 +137,42 @@ class BaseFitter:
         # Init SMPL, pose with mean smpl pose, as in ch.registration
         # smpl = SMPLHPyTorchWrapperBatch(self.model_root, batch_sz, betas, pose, trans,
         #                                 num_betas=num_betas, device=self.device, gender=gender).to(self.device)
-        smpl = SMPL(
-            model_path=Path(self.model_root, f"SMPL_{gender}.pkl"),
-            kid_template_path="",
-            data_struct=None,
-            create_betas=True,
-            betas=betas,
-            num_betas=betas.shape[1],
-            create_global_orient=True,
-            global_orient=pose[:, :3],  # first three elements of pose, "the root bone"
-            create_body_pose=True,
-            body_pose=pose[:, 3:],  # the rest of the pose
-            create_transl=True,
-            transl=trans,
-            dtype=torch.float32,
-            batch_size=batch_sz,
-            joint_mapper=None,
-            gender=gender,
-            age="adult",
-            vertex_ids=None,
-            v_template=None,  # TODO don't know what this is, it is basically, "vertices"
-        ).to(self.device)
 
-        return smpl
+        if split_params:
+            smpl = SplitSMPL(
+                model_path=Path(self.model_root, f"SMPL_{gender}.pkl"),
+                batch_size=batch_sz,
+                gender=gender,
+                betas=betas,
+                pose=pose,
+                transl=trans,
+                split_params_args=split_params_args,
+            ).to(self.device)
+            return smpl
 
-    def init_smpl(
-        self,
-        batch_sz: int,
-        gender: str,
-        pose: Optional[torch.Tensor] = None,
-        betas: Optional[torch.Tensor] = None,
-        trans: Optional[torch.Tensor] = None,
-        flip: Optional[bool] = False,
-    ):
-        """
-        initialize a smpl batch model
-        Args:
-            batch_sz:
-            gender:
-            flip: rotate smpl around z-axis by 180 degree, required for kinect point clouds, which has different coordinate
-            from scans
-
-        Returns: batch smplh model
-
-        """
-        # sp = SmplPaths(gender=gender)
-        # smpl_faces = sp.get_faces()
-        # th_faces = torch.tensor(smpl_faces.astype('float32'), dtype=torch.long).to(self.device)
-        num_betas = 10
-        prior = get_prior(self.model_root, gender=gender, device=self.device)
-        total_pose_num = SMPLH_POSE_PRAMS_NUM if self.hands else SMPL_POSE_PRAMS_NUM
-        pose_init = torch.zeros((batch_sz, total_pose_num))
-        if pose is None:
-            # initialize hand pose from mean
-            pose_init[:, 3:SMPLH_HANDPOSE_START] = prior.mean
-            if self.hands:
-                hand_mean = mean_hand_pose(self.model_root)
-                hand_init = torch.tensor(hand_mean, dtype=torch.float).to(self.device)
-            else:
-                hand_init = torch.zeros((batch_sz, SMPL_HAND_POSE_NUM))
-            pose_init[:, SMPLH_HANDPOSE_START:] = hand_init
-            if flip:
-                pose_init[:, 2] = np.pi
         else:
-            pose_init[:, :SMPLH_HANDPOSE_START] = pose[:, :SMPLH_HANDPOSE_START]
-            if pose.shape[1] == total_pose_num:
-                pose_init[:, SMPLH_HANDPOSE_START:] = pose[:, SMPLH_HANDPOSE_START:]
-        beta_init = torch.zeros((batch_sz, num_betas)) if betas is None else betas
-        trans_init = torch.zeros((batch_sz, 3)) if trans is None else trans
-        betas, pose, trans = beta_init, pose_init, trans_init
-        # Init SMPL, pose with mean smpl pose, as in ch.registration
-        # smpl = SMPLHPyTorchWrapperBatch(self.model_root, batch_sz, betas, pose, trans,
-        #                                 num_betas=num_betas, device=self.device, gender=gender).to(self.device)
-        smpl = SMPLPyTorchWrapperBatch(
-            self.model_root,
-            batch_sz,
-            betas,
-            pose,
-            trans,
-            num_betas=num_betas,
-            device=self.device,
-            gender=gender,
-            hands=self.hands,
-        ).to(self.device)
-        return smpl
+            smpl = SMPL(
+                model_path=Path(self.model_root, f"SMPL_{gender}.pkl"),
+                kid_template_path="",
+                data_struct=None,
+                create_betas=True,
+                betas=betas,
+                num_betas=betas.shape[1],
+                create_global_orient=True,
+                global_orient=pose[:, :3],  # first three elements of pose, "the root bone"
+                create_body_pose=True,
+                body_pose=pose[:, 3:],  # the rest of the pose
+                create_transl=True,
+                transl=trans,
+                dtype=torch.float32,
+                batch_size=batch_sz,
+                joint_mapper=None,
+                gender=gender,
+                age="adult",
+                vertex_ids=None,
+                v_template=None,  # TODO don't know what this is, it is basically, "vertices"
+            ).to(self.device)
+            return smpl
 
     @staticmethod
     def load_smpl_params(pkl_files: list[str]):
