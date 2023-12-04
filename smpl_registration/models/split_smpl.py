@@ -76,11 +76,14 @@ class SplitSMPL(torch.nn.Module):
     def forward(self, **kwargs) -> SMPLOutput:
         # the forward function of SMPLLayer expects rotation matrices instead of axis-angle
         rot_global_orient = axis_angle_to_matrix(self.global_orient)
-        rot_body_pose = axis_angle_to_matrix(self.body_pose.reshape(self.batch_size, -1, 3))
+        full_pose = torch.cat(
+            [self.body_pose, self.hand_pose], dim=1
+        )  # doesn't include global orient
+        rot_full_pose = axis_angle_to_matrix(full_pose.reshape(self.batch_size, -1, 3))
 
         output = self.layer.forward(
             betas=torch.cat([self.top_betas, self.other_betas], dim=1),
-            body_pose=rot_body_pose,
+            body_pose=rot_full_pose,  # this includes hand pose
             global_orient=rot_global_orient,
             transl=self.transl,
             **kwargs
