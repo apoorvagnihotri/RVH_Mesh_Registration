@@ -302,7 +302,7 @@ class BaseFitter:
     @staticmethod
     def load_scans(
         scans: list[str], device: str = "cuda:0", ret_cent: bool = False
-    ) -> tuple[Meshes, torch.Tensor] | Meshes:
+    ) -> Union[tuple[Meshes, torch.Tensor], Meshes]:
         verts, faces, centers = [], [], []
         for scan in scans:
             print("scan path ...", scan)
