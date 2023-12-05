@@ -226,16 +226,19 @@ class BaseFitter:
         # self.save_meshes(th_scan_meshes, [join(save_path, n) for n in names]) # save original scans
         # Save params
         self.save_smpl_params(names, save_path, smpl, save_name)
+        output = smpl.forward(return_full_pose=True)
         return (
-            smpl.pose.cpu().detach().numpy(),
+            output.full_pose.cpu().detach().numpy(),
             smpl.betas.cpu().detach().numpy(),
-            smpl.trans.cpu().detach().numpy(),
+            smpl.transl.cpu().detach().numpy(),
         )
 
     def smpl2meshes(self, smpl):
         "convert smpl batch to pytorch3d meshes"
-        verts, _, _, _ = smpl()
-        th_smpl_meshes = Meshes(verts=verts, faces=torch.stack([smpl.faces] * len(verts), dim=0))
+        # verts, _, _, _ = smpl()
+        output = smpl.forward(return_full_pose=True)
+        verts = output.vertices
+        th_smpl_meshes = Meshes(verts=verts, faces=torch.stack([smpl.faces_tensor] * len(verts), dim=0))
         return th_smpl_meshes
 
     def get_mesh_paths(self, save_name, save_path, scan_paths):
@@ -250,10 +253,11 @@ class BaseFitter:
         return mesh_paths, names
 
     def save_smpl_params(self, names, save_path, smpl, save_name):
+        output = smpl.forward(return_full_pose=True)
         for p, b, t, n in zip(
-            smpl.pose.cpu().detach().numpy(),
+            output.full_pose.cpu().detach().numpy(),
             smpl.betas.cpu().detach().numpy(),
-            smpl.trans.cpu().detach().numpy(),
+            smpl.transl.cpu().detach().numpy(),
             names,
         ):
             smpl_dict = {"pose": p, "betas": b, "trans": t}

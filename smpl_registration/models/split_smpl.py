@@ -94,5 +94,5 @@ class SplitSMPL(torch.nn.Module):
         output.global_orient = matrix_to_axis_angle(output.global_orient)
         output.body_pose = matrix_to_axis_angle(output.body_pose).reshape(self.batch_size, -1)
         if kwargs.get("return_full_pose", False):
-            output.full_pose = torch.concat([output.global_orient, output.body_pose], dim=1)
+            output.full_pose = torch.cat([output.global_orient, output.body_pose], dim=1)
         return output
